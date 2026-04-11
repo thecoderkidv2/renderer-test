@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>WebGPU PBR Renderer</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #080810; }
+  canvas { width: 100%; height: 100%; display: block; cursor: grab; }
+  canvas:active { cursor: grabbing; }
+  #gizmo { position: fixed; top: 16px; right: 16px; width: 90px; height: 90px; pointer-events: none; }
+  #fs { position: absolute; bottom: 8px; left: 8px; width: 50px; height: 50px;
+        background: #000000a0; border-radius: 10px; border: none; cursor: pointer; }
+  #fs:hover { background: #ffffff18; }
+  #status { position: fixed; top: 16px; left: 16px; color: #ffffffaa; font: 13px/1.6 monospace; pointer-events: none; }
+</style>
+</head>
+<body>
+<canvas id="gpuCanvas"></canvas>
+<canvas id="gizmo" width="180" height="180"></canvas>
+<div id="status">Loading…</div>
+<button id="fs" onclick="document.fullscreenElement?document.exitFullscreen():document.body.requestFullscreen().catch(()=>{})">
+  <svg viewBox="0 0 15 15" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <path fill-rule="evenodd" clip-rule="evenodd" d="M2 2.5C2 2.22386 2.22386 2 2.5 2H5.5C5.77614 2 6 2.22386 6 2.5C6 2.77614 5.77614 3 5.5 3H3V5.5C3 5.77614 2.77614 6 2.5 6C2.22386 6 2 5.77614 2 5.5V2.5ZM9 2.5C9 2.22386 9.22386 2 9.5 2H12.5C12.7761 2 13 2.22386 13 2.5V5.5C13 5.77614 12.7761 6 12.5 6C12.2239 6 12 5.77614 12 5.5V3H9.5C9.22386 3 9 2.77614 9 2.5ZM2.5 9C2.77614 9 3 9.22386 3 9.5V12H5.5C5.77614 12 6 12.2239 6 12.5C6 12.7761 5.77614 13 5.5 13H2.5C2.22386 13 2 12.7761 2 12.5V9.5C2 9.22386 2.22386 9 2.5 9ZM12.5 9C12.7761 9 13 9.22386 13 9.5V12.5C13 12.7761 12.7761 13 12.5 13H9.5C9.22386 13 9 12.7761 9 12.5C9 12.2239 9.22386 12 9.5 12H12V9.5C12 9.22386 12.2239 9 12.5 9Z" fill="#fff"/>
+  </svg>
+</button>
+
+<script src="map.js"></script>
+<script type="module">
+
+// ════════════════════════════════════════════════════════════════════════════
+// CONFIG
+// ════════════════════════════════════════════════════════════════════════════
+const PX_PER_UNIT  = 1024;
+const LIGHT_POS    = [4, 7, 5];
+const LIGHT_COLOR  = [1.0, 0.95, 0.88];  // warm white
+const LIGHT_POWER  = 120.0;              // 1/d² strength
+const AMBIENT_SKY  = [0.18, 0.22, 0.30]; // cool sky bounce
+const AMBIENT_GRND = [0.08, 0.06, 0.04]; // warm ground bounce
+const MIN_LIGHT    = 0.04;               // absolute floor
+
+// ════════════════════════════════════════════════════════════════════════════
+// DEVICE INIT
+// ════════════════════════════════════════════════════════════════════════════
+const statusEl = document.getElementById('status');
+const canvas   = document.getElementById('gpuCanvas');
+const gizmo    = document.getElementById('gizmo');
+const gctx     = gizmo.getContext('2d');
+
+if (!navigator.gpu) { alert('WebGPU not supported.'); throw 0; }
+const adapter = await navigator.gpu.requestAdapter();
+const device  = await adapter.requestDevice();
+const ctx     = canvas.getContext('webgpu');
+const fmt     = navigator.gpu.getPreferredCanvasFormat();
+
+let depthTex;
+function resize() {
+  const dpr = devicePixelRatio;
+  canvas.width  = Math.floor(window.innerWidth  * dpr);
+  canvas.height = Math.floor(window.innerHeight * dpr);
+  ctx.configure({ device, format: fmt, alphaMode: 'opaque' });
+  depthTex?.destroy();
+  depthTex = device.createTexture({
+    size: [canvas.width, canvas.height],
+    format: 'depth24plus',
+    usage: GPUTextureUsage.RENDER_ATTACHMENT,
+  });
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ════════════════════════════════════════════════════════════════════════════
+// TEXTURE UTILITIES
+// ════════════════════════════════════════════════════════════════════════════
+
+function mipCount(w, h) { return Math.floor(Math.log2(Math.max(w, h))) + 1; }
+
+function downsample(src, sw, sh) {
+  const dw = Math.max(1, sw >> 1), dh = Math.max(1, sh >> 1);
+  const dst = new Uint8ClampedArray(dw * dh * 4);
+  for (let y = 0; y < dh; y++) {
+    for (let x = 0; x < dw; x++) {
+      const s = (sx, sy) => {
+        const i = (Math.min(sy,sh-1)*sw + Math.min(sx,sw-1))*4;
+        return [src[i],src[i+1],src[i+2],src[i+3]];
+      };
+      const [r0,g0,b0,a0]=s(x*2,  y*2);
+      const [r1,g1,b1,a1]=s(x*2+1,y*2);
+      const [r2,g2,b2,a2]=s(x*2,  y*2+1);
+      const [r3,g3,b3,a3]=s(x*2+1,y*2+1);
+      const o=(y*dw+x)*4;
+      dst[o]=(r0+r1+r2+r3)>>2; dst[o+1]=(g0+g1+g2+g3)>>2;
+      dst[o+2]=(b0+b1+b2+b3)>>2; dst[o+3]=(a0+a1+a2+a3)>>2;
+    }
+  }
+  return {data:dst, width:dw, height:dh};
+}
+
+function uploadWithMips(pixels, w, h) {
+  const levels = mipCount(w, h);
+  const tex = device.createTexture({
+    size: [w, h], format: 'rgba8unorm', mipLevelCount: levels,
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+  });
+  device.queue.writeTexture({texture:tex,mipLevel:0}, pixels, {bytesPerRow:w*4}, [w,h]);
+  let cur = {data:pixels, width:w, height:h};
+  for (let lvl=1; lvl<levels; lvl++) {
+    cur = downsample(cur.data, cur.width, cur.height);
+    device.queue.writeTexture({texture:tex,mipLevel:lvl}, cur.data, {bytesPerRow:cur.width*4}, [cur.width,cur.height]);
+  }
+  return tex;
+}
+
+function bitmapToPixels(bitmap, hueDeg) {
+  const oc = new OffscreenCanvas(bitmap.width, bitmap.height);
+  const c  = oc.getContext('2d');
+  if (hueDeg) c.filter = `hue-rotate(${hueDeg}deg)`;
+  c.drawImage(bitmap, 0, 0);
+  return c.getImageData(0, 0, bitmap.width, bitmap.height).data;
+}
+
+function generateNormalMap(pixels, w, h, strength=3.5) {
+  const out = new Uint8ClampedArray(w*h*4);
+  const luma = (x, y) => {
+    const i=(Math.min(y,h-1)*w+Math.min(x,w-1))*4;
+    return (pixels[i]*0.2126+pixels[i+1]*0.7152+pixels[i+2]*0.0722)/255;
+  };
+  for (let y=0; y<h; y++) for (let x=0; x<w; x++) {
+    let nx=(luma(Math.max(x-1,0),y)-luma(Math.min(x+1,w-1),y))*strength;
+    let ny=(luma(x,Math.max(y-1,0))-luma(x,Math.min(y+1,h-1)))*strength;
+    let nz=1.0;
+    const l=Math.hypot(nx,ny,nz);
+    nx/=l; ny/=l; nz/=l;
+    const i=(y*w+x)*4;
+    out[i]=(nx*0.5+0.5)*255; out[i+1]=(ny*0.5+0.5)*255;
+    out[i+2]=(nz*0.5+0.5)*255; out[i+3]=255;
+  }
+  return out;
+}
+
+async function fetchBitmap(src) {
+  const blob = await (await fetch(src)).blob();
+  return createImageBitmap(blob);
+}
+
+async function loadTextureDef(def) {
+  const bm  = await fetchBitmap(def.src);
+  const hue = def.hue || 0;
+  const albPx = bitmapToPixels(bm, hue);
+  const albTex = uploadWithMips(albPx, bm.width, bm.height);
+
+  let normTex;
+  if (def.normal === 'auto') {
+    normTex = uploadWithMips(generateNormalMap(albPx, bm.width, bm.height), bm.width, bm.height);
+  } else {
+    const nbm = await fetchBitmap(def.normal);
+    normTex = uploadWithMips(bitmapToPixels(nbm, 0), nbm.width, nbm.height);
+  }
+  return { albedo:albTex, normal:normTex, metallic:def.metallic??0.0, roughness:def.roughness??0.8 };
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// GEOMETRY
+// ════════════════════════════════════════════════════════════════════════════
+function buildBox(pos, size) {
+  const [cx,cy,cz]=pos, [sw,sh,sd]=size;
+  const [hw,hh,hd]=[sw/2,sh/2,sd/2];
+  const faces = [
+    {n:[0,0,1], t:[1,0,0], ps:[[-hw,-hh,hd],[hw,-hh,hd],[hw,hh,hd],[-hw,hh,hd]],   fu:sw,fv:sh},
+    {n:[0,0,-1],t:[-1,0,0],ps:[[hw,-hh,-hd],[-hw,-hh,-hd],[-hw,hh,-hd],[hw,hh,-hd]],fu:sw,fv:sh},
+    {n:[1,0,0], t:[0,0,-1],ps:[[hw,-hh,hd],[hw,-hh,-hd],[hw,hh,-hd],[hw,hh,hd]],    fu:sd,fv:sh},
+    {n:[-1,0,0],t:[0,0,1], ps:[[-hw,-hh,-hd],[-hw,-hh,hd],[-hw,hh,hd],[-hw,hh,-hd]],fu:sd,fv:sh},
+    {n:[0,1,0], t:[1,0,0], ps:[[-hw,hh,hd],[hw,hh,hd],[hw,hh,-hd],[-hw,hh,-hd]],    fu:sw,fv:sd},
+    {n:[0,-1,0],t:[1,0,0], ps:[[-hw,-hh,-hd],[hw,-hh,-hd],[hw,-hh,hd],[-hw,-hh,hd]], fu:sw,fv:sd},
+  ];
+  const verts=[], idxs=[];
+  faces.forEach(({n,t,ps,fu,fv}) => {
+    const base=verts.length/11;
+    const uvc=[[0,0],[fu,0],[fu,fv],[0,fv]];
+    ps.forEach(([px,py,pz],i)=>verts.push(cx+px,cy+py,cz+pz,...n,...t,...uvc[i]));
+    idxs.push(base,base+1,base+2,base,base+2,base+3);
+  });
+  const vb=device.createBuffer({size:verts.length*4,usage:GPUBufferUsage.VERTEX|GPUBufferUsage.COPY_DST});
+  device.queue.writeBuffer(vb,0,new Float32Array(verts));
+  const ib=device.createBuffer({size:idxs.length*2,usage:GPUBufferUsage.INDEX|GPUBufferUsage.COPY_DST});
+  device.queue.writeBuffer(ib,0,new Uint16Array(idxs));
+  return {vb, ib, indexCount:idxs.length};
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// SHADER
+// ════════════════════════════════════════════════════════════════════════════
+const SHADER = /* wgsl */`
+struct Uni {
+  mvp       : mat4x4<f32>,   // offset 0
+  normalMat : mat4x4<f32>,   // offset 64
+  camPos    : vec3<f32>,     // offset 128
+  _p0       : f32,
+  lightPos  : vec3<f32>,     // offset 144
+  lightPow  : f32,           // offset 156
+  lightCol  : vec3<f32>,     // offset 160
+  _p1       : f32,
+  ambSky    : vec3<f32>,     // offset 176
+  _p2       : f32,
+  ambGrnd   : vec3<f32>,     // offset 192
+  minLight  : f32,           // offset 204
+  metallic  : f32,           // offset 208
+  roughness : f32,           // offset 212
+};
+
+@group(0) @binding(0) var<uniform> u   : Uni;
+@group(0) @binding(1) var albTex       : texture_2d<f32>;
+@group(0) @binding(2) var normTex      : texture_2d<f32>;
+@group(0) @binding(3) var samp         : sampler;
+
+struct VSOut {
+  @builtin(position) pos : vec4<f32>,
+  @location(0) wPos : vec3<f32>,
+  @location(1) T    : vec3<f32>,
+  @location(2) B    : vec3<f32>,
+  @location(3) N    : vec3<f32>,
+  @location(4) uv   : vec2<f32>,
+};
+
+@vertex fn vs(
+  @location(0) pos     : vec3<f32>,
+  @location(1) normal  : vec3<f32>,
+  @location(2) tangent : vec3<f32>,
+  @location(3) uv      : vec2<f32>,
+) -> VSOut {
+  var o : VSOut;
+  o.pos  = u.mvp * vec4<f32>(pos, 1.0);
+  o.wPos = pos;
+  let N = normalize((u.normalMat * vec4<f32>(normal,  0.0)).xyz);
+  let T = normalize((u.normalMat * vec4<f32>(tangent, 0.0)).xyz);
+  o.N = N; o.T = T; o.B = cross(N, T); o.uv = uv;
+  return o;
+}
+
+const PI : f32 = 3.14159265358979;
+
+fn D_GGX(NdH: f32, a2: f32) -> f32 {
+  let d = NdH*NdH*(a2-1.0)+1.0;
+  return a2 / max(PI*d*d, 0.00001);
+}
+fn G_Schlick(NdX: f32, k: f32) -> f32 { return NdX / (NdX*(1.0-k)+k); }
+fn G_Smith(NdV: f32, NdL: f32, r: f32) -> f32 {
+  let k=(r+1.0)*(r+1.0)/8.0;
+  return G_Schlick(max(NdV,0.001),k)*G_Schlick(max(NdL,0.0),k);
+}
+fn F_Schlick(cosT: f32, F0: vec3<f32>) -> vec3<f32> {
+  return F0 + (1.0-F0)*pow(clamp(1.0-cosT,0.0,1.0),5.0);
+}
+fn aces(x: vec3<f32>) -> vec3<f32> {
+  return clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14), vec3(0.0), vec3(1.0));
+}
+
+@fragment fn fs(in: VSOut) -> @location(0) vec4<f32> {
+  let albedo = textureSample(albTex,  samp, in.uv).rgb;
+  let nSamp  = textureSample(normTex, samp, in.uv).rgb * 2.0 - 1.0;
+
+  // World-space shading normal via TBN
+  let TBN = mat3x3<f32>(normalize(in.T), normalize(in.B), normalize(in.N));
+  let N   = normalize(TBN * nSamp);
+  let V   = normalize(u.camPos - in.wPos);
+
+  let metal = u.metallic;
+  let rough = clamp(u.roughness, 0.05, 1.0);
+  let a2    = rough*rough*rough*rough;
+  let F0    = mix(vec3(0.04), albedo, metal);
+
+  // ── Point light (physically correct 1/d² falloff) ──
+  let toL   = u.lightPos - in.wPos;
+  let dist2 = dot(toL, toL);
+  let L     = normalize(toL);
+  let H     = normalize(V + L);
+  let atten = u.lightPow / max(dist2, 0.01);
+  let rad   = u.lightCol * atten;
+
+  let NdL = max(dot(N,L), 0.0);
+  let NdV = max(dot(N,V), 0.001);
+  let NdH = max(dot(N,H), 0.0);
+  let HdV = max(dot(H,V), 0.0);
+
+  let F    = F_Schlick(HdV, F0);
+  let spec = (D_GGX(NdH,a2)*G_Smith(NdV,NdL,rough)*F) / (4.0*NdV*max(NdL,0.001)+0.0001);
+  let kD   = (vec3(1.0)-F)*(1.0-metal);
+  let Lo   = (kD*albedo/PI + spec)*rad*NdL;
+
+  // ── Hemisphere GI: sky above, ground bounce below ──
+  let hemi   = N.y*0.5+0.5;
+  let ambCol = mix(u.ambGrnd, u.ambSky, hemi);
+  let kDamb  = (vec3(1.0)-F_Schlick(NdV,F0))*(1.0-metal);
+  let ambient = kDamb*albedo*ambCol;
+
+  // ── Absolute brightness floor ──
+  let minAmb = albedo*u.minLight;
+  var color  = Lo + max(ambient, minAmb);
+
+  // ── ACES filmic tonemap + sRGB gamma ──
+  color = pow(aces(color), vec3(1.0/2.2));
+  return vec4(color, 1.0);
+}
+`;
+
+// ════════════════════════════════════════════════════════════════════════════
+// PIPELINE + SAMPLER
+// ════════════════════════════════════════════════════════════════════════════
+const shaderMod = device.createShaderModule({ code: SHADER });
+const pipeline  = device.createRenderPipeline({
+  layout: 'auto',
+  vertex: {
+    module: shaderMod, entryPoint: 'vs',
+    buffers: [{ arrayStride: 44, attributes: [
+      {shaderLocation:0, offset: 0, format:'float32x3'},
+      {shaderLocation:1, offset:12, format:'float32x3'},
+      {shaderLocation:2, offset:24, format:'float32x3'},
+      {shaderLocation:3, offset:36, format:'float32x2'},
+    ]}],
+  },
+  fragment: { module: shaderMod, entryPoint: 'fs', targets: [{format:fmt}] },
+  primitive: { topology: 'triangle-list', cullMode: 'back' },
+  depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
+});
+
+const sampler = device.createSampler({
+  magFilter:    'linear',
+  minFilter:    'linear',
+  mipmapFilter: 'linear',
+  addressModeU: 'repeat',
+  addressModeV: 'repeat',
+  maxAnisotropy: 16,
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// UNIFORM BUFFER  (256 bytes — one per draw call)
+// ════════════════════════════════════════════════════════════════════════════
+const UNI_BYTES = 256;
+function makeUB() {
+  return device.createBuffer({ size: UNI_BYTES, usage: GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST });
+}
+function writeUB(ub, mvp, nm, camPos, metallic, roughness) {
+  const d = new Float32Array(UNI_BYTES/4);
+  d.set(mvp, 0);  // [0..15]
+  d.set(nm,  16); // [16..31]  (mat4 slot for normal matrix)
+  d[32]=camPos[0]; d[33]=camPos[1]; d[34]=camPos[2]; d[35]=0;
+  d[36]=LIGHT_POS[0]; d[37]=LIGHT_POS[1]; d[38]=LIGHT_POS[2]; d[39]=LIGHT_POWER;
+  d[40]=LIGHT_COLOR[0]; d[41]=LIGHT_COLOR[1]; d[42]=LIGHT_COLOR[2]; d[43]=0;
+  d[44]=AMBIENT_SKY[0]; d[45]=AMBIENT_SKY[1]; d[46]=AMBIENT_SKY[2]; d[47]=0;
+  d[48]=AMBIENT_GRND[0]; d[49]=AMBIENT_GRND[1]; d[50]=AMBIENT_GRND[2]; d[51]=MIN_LIGHT;
+  d[52]=metallic; d[53]=roughness;
+  device.queue.writeBuffer(ub, 0, d);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// MATH
+// ════════════════════════════════════════════════════════════════════════════
+const identity = () => new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]);
+function mul(a,b){ const o=new Float32Array(16); for(let r=0;r<4;r++) for(let c=0;c<4;c++) for(let k=0;k<4;k++) o[r+c*4]+=a[r+k*4]*b[k+c*4]; return o; }
+function perspective(fov,asp,n,f){ const t=1/Math.tan(fov/2),nf=1/(n-f),o=new Float32Array(16); o[0]=t/asp;o[5]=t;o[10]=(f+n)*nf;o[11]=-1;o[14]=2*f*n*nf; return o; }
+function rotX(a){ const c=Math.cos(a),s=Math.sin(a),o=identity(); o[5]=c;o[6]=s;o[9]=-s;o[10]=c; return o; }
+function rotY(a){ const c=Math.cos(a),s=Math.sin(a),o=identity(); o[0]=c;o[2]=-s;o[8]=s;o[10]=c; return o; }
+function trans(x,y,z){ const o=identity(); o[12]=x;o[13]=y;o[14]=z; return o; }
+function tdir(m,v){ return [m[0]*v[0]+m[4]*v[1]+m[8]*v[2], m[1]*v[0]+m[5]*v[1]+m[9]*v[2], m[2]*v[0]+m[6]*v[1]+m[10]*v[2]]; }
+
+// ════════════════════════════════════════════════════════════════════════════
+// LOAD SCENE
+// ════════════════════════════════════════════════════════════════════════════
+statusEl.textContent = 'Loading textures…';
+const uniqueDefs = [...new Set(scene.map(o=>o.texture))];
+const texResults = await Promise.all(uniqueDefs.map(loadTextureDef));
+const texMap = new Map(uniqueDefs.map((d,i)=>[d,texResults[i]]));
+
+statusEl.textContent = 'Building geometry…';
+const drawCalls = scene.map(obj => {
+  const tex  = texMap.get(obj.texture);
+  const geom = buildBox(obj.pos, obj.size);
+  const ub   = makeUB();
+  const bg   = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [
+      {binding:0, resource:{buffer:ub}},
+      {binding:1, resource:tex.albedo.createView()},
+      {binding:2, resource:tex.normal.createView()},
+      {binding:3, resource:sampler},
+    ],
+  });
+  return { ...geom, ub, bg, metallic:tex.metallic, roughness:tex.roughness };
+});
+statusEl.textContent = '';
+
+// ════════════════════════════════════════════════════════════════════════════
+// GIZMO
+// ════════════════════════════════════════════════════════════════════════════
+const GCX=90,GCY=90,GLEN=62;
+const AXES=[{dir:[1,0,0],label:'X',color:'#e05555',neg:'#7a2020'},{dir:[0,1,0],label:'Y',color:'#55bb55',neg:'#1f6b1f'},{dir:[0,0,1],label:'Z',color:'#4488ee',neg:'#1a3d99'}];
+function drawGizmo(model){
+  gctx.clearRect(0,0,180,180);
+  const pts=AXES.map(ax=>{const w=tdir(model,ax.dir);return{x:w[0]*GLEN,y:-w[1]*GLEN,z:w[2],label:ax.label,color:ax.color,neg:ax.neg};});
+  const dl=[];
+  pts.forEach(p=>{dl.push({x:GCX-p.x,y:GCY-p.y,z:-p.z,color:p.neg,tip:false,lbl:'-'+p.label});dl.push({x:GCX+p.x,y:GCY+p.y,z:p.z,color:p.color,tip:true,lbl:p.label});});
+  dl.sort((a,b)=>a.z-b.z);
+  dl.forEach(it=>{
+    gctx.beginPath();gctx.moveTo(GCX,GCY);gctx.lineTo(it.x,it.y);gctx.strokeStyle=it.color;gctx.lineWidth=it.tip?2.5:1.5;gctx.globalAlpha=it.tip?1:0.35;gctx.stroke();
+    if(it.tip){gctx.beginPath();gctx.arc(it.x,it.y,5,0,Math.PI*2);gctx.fillStyle=it.color;gctx.globalAlpha=1;gctx.fill();const dx=it.x-GCX,dy=it.y-GCY,l=Math.hypot(dx,dy)||1;gctx.fillStyle='#fff';gctx.font='bold 13px sans-serif';gctx.textAlign='center';gctx.textBaseline='middle';gctx.fillText(it.lbl,it.x+dx/l*10,it.y+dy/l*10);}
+    gctx.globalAlpha=1;
+  });
+  gctx.beginPath();gctx.arc(GCX,GCY,4,0,Math.PI*2);gctx.fillStyle='#888';gctx.fill();
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// CAMERA
+// ════════════════════════════════════════════════════════════════════════════
+let yaw=-0.4,pitch=0.3,zoom=8,tZoom=8,yawV=0,pitchV=0;
+const DAMP=0.88,DSPD=0.005;
+let drag=false,lx=0,ly=0,ldx=0,ldy=0;
+canvas.addEventListener('mousedown',e=>{drag=true;lx=e.clientX;ly=e.clientY;ldx=0;ldy=0;});
+window.addEventListener('mouseup',()=>{if(drag){yawV=ldx*DSPD;pitchV=ldy*DSPD;}drag=false;});
+window.addEventListener('mousemove',e=>{if(!drag)return;ldx=e.clientX-lx;ldy=e.clientY-ly;yaw+=ldx*DSPD;pitch=Math.max(-1.55,Math.min(1.55,pitch+ldy*DSPD));lx=e.clientX;ly=e.clientY;});
+canvas.addEventListener('wheel',e=>{tZoom=Math.max(1.5,Math.min(30,tZoom+e.deltaY*0.02));e.preventDefault();},{passive:false});
+let t0=null,p0=null,ltdx=0,ltdy=0;
+canvas.addEventListener('touchstart',e=>{e.preventDefault();if(e.touches.length===1){t0={x:e.touches[0].clientX,y:e.touches[0].clientY};ltdx=0;ltdy=0;p0=null;}else if(e.touches.length===2){p0=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,e.touches[0].clientY-e.touches[1].clientY);t0=null;}},{passive:false});
+canvas.addEventListener('touchmove',e=>{e.preventDefault();if(e.touches.length===1&&t0){ltdx=e.touches[0].clientX-t0.x;ltdy=e.touches[0].clientY-t0.y;yaw+=ltdx*DSPD*1.5;pitch=Math.max(-1.55,Math.min(1.55,pitch+ltdy*DSPD*1.5));t0={x:e.touches[0].clientX,y:e.touches[0].clientY};}else if(e.touches.length===2&&p0!==null){const d=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,e.touches[0].clientY-e.touches[1].clientY);tZoom=Math.max(1.5,Math.min(30,tZoom*(p0/d)));p0=d;}},{passive:false});
+canvas.addEventListener('touchend',e=>{if(e.touches.length===0&&t0){yawV=ltdx*DSPD*1.5;pitchV=ltdy*DSPD*1.5;}t0=null;p0=null;},{passive:false});
+
+// ════════════════════════════════════════════════════════════════════════════
+// RENDER LOOP
+// ════════════════════════════════════════════════════════════════════════════
+function frame() {
+  if(!drag){
+    yaw+=yawV; yawV*=DAMP; if(Math.abs(yawV)<0.0001)yawV=0;
+    pitch+=pitchV; pitchV*=DAMP; if(Math.abs(pitchV)<0.0001)pitchV=0;
+    pitch=Math.max(-1.55,Math.min(1.55,pitch));
+  }
+  zoom+=(tZoom-zoom)*0.12;
+
+  const aspect = canvas.width/canvas.height;
+  const model  = mul(rotY(yaw), rotX(pitch));
+  const mvp    = mul(perspective(Math.PI/4,aspect,0.05,500), mul(trans(0,0,-zoom), model));
+
+  // Camera world position: transpose-rotate the camera-space position back to world
+  const camPos = tdir(
+    [model[0],model[4],model[8],0,model[1],model[5],model[9],0,model[2],model[6],model[10],0,0,0,0,1],
+    [0, 0, zoom]
+  );
+
+  // Write all UBs before the render pass
+  for (const dc of drawCalls)
+    writeUB(dc.ub, mvp, model, camPos, dc.metallic, dc.roughness);
+
+  const enc  = device.createCommandEncoder();
+  const pass = enc.beginRenderPass({
+    colorAttachments: [{
+      view: ctx.getCurrentTexture().createView(),
+      clearValue: {r:0.04,g:0.04,b:0.07,a:1},
+      loadOp:'clear', storeOp:'store',
+    }],
+    depthStencilAttachment: {
+      view: depthTex.createView(),
+      depthClearValue:1, depthLoadOp:'clear', depthStoreOp:'store',
+    },
+  });
+  pass.setPipeline(pipeline);
+  for (const dc of drawCalls) {
+    pass.setBindGroup(0, dc.bg);
+    pass.setVertexBuffer(0, dc.vb);
+    pass.setIndexBuffer(dc.ib, 'uint16');
+    pass.drawIndexed(dc.indexCount);
+  }
+  pass.end();
+  device.queue.submit([enc.finish()]);
+
+  drawGizmo(model);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
